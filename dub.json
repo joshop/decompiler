@@ -1,0 +1,13 @@
+{
+	"authors": [
+		"rous"
+	],
+	"copyright": " ",
+	"dependencies": {
+		"capstone-d": "~>2.1.1",
+		"elf-d": "~>0.2.5"
+	},
+	"description": "decompiler",
+	"license": " ",
+	"name": "decompiler"
+}

@@ -1,0 +1,15 @@
+.dub
+docs.json
+__dummy.html
+docs/
+/decompiler
+decompiler.so
+decompiler.dylib
+decompiler.dll
+decompiler.a
+decompiler.lib
+decompiler-test-*
+*.exe
+*.o
+*.obj
+*.lst
