@@ -1,11 +1,7 @@
 #include <stdio.h>
 
-int myfunction() {
-	return 4;
-}
-
 int main() {
-	printf("Hello, world!\n");
-	int a = myfunction();
-	printf("%d\n", a);
+	int var1 = 10;
+	int var2 = var1++;
+	printf("%d %d\n", var1, var2);
 }

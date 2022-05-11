@@ -38,7 +38,7 @@ enum Operator {
 	ADDRESS
 }
 bool precedenceOver(Operator inside, Operator outside) {
-	Operator[][] precedence = [[Operator.LOGICALOR], [Operator.LOGICALAND], [Operator.OR], [Operator.XOR], [Operator.AND], [Operator.EQUALS, Operator.NOTEQUALS], [Operator.GREATER, Operator.LESS, Operator.GREATEREQUALS, Operator.LESSEQUALS], [Operator.LEFTSHIFT, Operator.RIGHTSHIFT], [Operator.ADD, Operator.SUBTRACT], [Operator.MULTIPLY, Operator.DIVIDE, Operator.MODULO], [Operator.INCREMENT, Operator.DECREMENT, Operator.LOGICALNOT, Operator.NOT, Operator.CAST, Operator.DEREFERENCE, Operator.ADDRESS, Operator.SIGNEXTEND], [Operator.INDEXED]];
+	Operator[][] precedence = [[Operator.LOGICALOR], [Operator.LOGICALAND], [Operator.OR], [Operator.XOR], [Operator.AND], [Operator.EQUALS, Operator.NOTEQUALS], [Operator.GREATER, Operator.LESS, Operator.GREATEREQUALS, Operator.LESSEQUALS], [Operator.LEFTSHIFT, Operator.RIGHTSHIFT], [Operator.ADD, Operator.SUBTRACT], [Operator.MULTIPLY, Operator.DIVIDE, Operator.MODULO], [Operator.INCREMENT, Operator.DECREMENT, Operator.LOGICALNOT, Operator.NOT, Operator.CAST, Operator.DEREFERENCE, Operator.SIGNEXTEND], [Operator.INDEXED], [Operator.ADDRESS]];
 	foreach(i; 0..precedence.length) {
 		if (precedence[i].canFind(inside) || precedence[i].canFind(outside)) {
 			return !precedence[i].canFind(outside);
@@ -77,6 +77,12 @@ class Atomic {
 	string typename() {
 		return "uint" ~ to!string(size*8) ~ "_t" ~ (isPointer ? "*" : "");
 	}
+	bool mostlyEqual(Atomic other) {
+		return value == other.value && type == other.type;
+	}
+	Atomic dup() {
+		return new Atomic(value, size, isPointer, type);
+	}
 }
 class Expression {
 	Expression left;
@@ -101,7 +107,7 @@ class Expression {
 		if (op == Operator.ATOMIC) return atomic.toString();
 		if (op == Operator.CAST) return "(" ~ atomic.typename() ~ ") " ~ left.toString();
 		if (op == Operator.INDEXED) return left.toString() ~ "[" ~ right.toString() ~ "]";
-		if (right is null) return opTexts[op] ~ " " ~ left.toString();
+		if (right is null) return opTexts[op] ~ " " ~ (precedenceOver(left.op, op) ? "(" : "") ~ left.toString() ~ (precedenceOver(left.op, op) ? ")" : "");
 		return (precedenceOver(left.op, op) ? "(" : "") ~ left.toString() ~ (precedenceOver(left.op, op) ? ")" : "") ~ " " ~ opTexts[op] ~ " " ~ (precedenceOver(right.op, op) ? "(" : "") ~ right.toString() ~ (precedenceOver(right.op, op) ? ")" : "");
 	}
 	@property bool isPointer() {
@@ -131,6 +137,20 @@ class Expression {
 		if (right !is null) right.beUsed();
 		if (op == Operator.ATOMIC && atomic.type == AtomicTypes.TEMPORARY) readTemps ~= atomic.value;
 	}
+	void clobber(Atomic kill, Atomic replace) {
+		if (op == Operator.ATOMIC && atomic.mostlyEqual(kill)) {
+			atomic = replace;
+		} else {
+			if (right !is null) right.clobber(kill, replace);
+			if (left !is null) left.clobber(kill, replace);
+		}
+	}
+	Expression dup() {
+		if (op == Operator.ATOMIC) {
+			return new Expression(atomic.dup);
+		}
+		return new Expression((left is null ? null : left.dup), op, (right is null ? null : right.dup));
+	}
 }
 string[] decompStr;
 class Statement {
@@ -140,8 +160,15 @@ class AssignStatement : Statement {
 	Expression destination;
 	Expression source;
 	this(Expression destination, Expression source) {
-		this.destination = destination;
-		this.source = source;
+		this.destination = destination.dup;
+		this.source = source.dup;
+		if (destination.op != Operator.ATOMIC) return;
+		int tempNum = usedTemps++;
+		decomp ~= new TempBackupStatement(destination, tempNum);
+		foreach (reg; state.byKeyValue) {
+			if (reg.value is null) continue;
+			reg.value.clobber(destination.atomic, new Atomic(tempNum, 8, false, AtomicTypes.TEMPORARY));
+		}
 	}
 	override string toString() {
 		return destination.toString() ~ " = " ~ source.toString() ~ ";";
@@ -169,6 +196,18 @@ class ReturnStatement : Statement {
 		return "return " ~ value.to!string ~ ";";
 	}
 }
+class TempBackupStatement : Statement {
+	Expression source;
+	int temp;
+	this(Expression source, int temp) {
+		this.source = source;
+		this.temp = temp;
+	}
+	override string toString() {
+		if (readTemps.canFind(temp)) return "temp" ~ temp.to!string ~ " = " ~ source.toString() ~ ";";
+		return "";
+	}
+}
 Expression[X86RegisterId] state;
 Statement[] decomp;
 ulong curAddress;
@@ -194,9 +233,7 @@ Expression fromOp(const(X86Op) op) {
 		if (op.mem.base.id != X86RegisterId.invalid && op.mem.index.id != X86RegisterId.invalid && op.size == state[op.mem.base.id].size) {
 			return new Expression(state[op.mem.base.id], Operator.INDEXED, state[op.mem.index.id]);
 		}
-		writeln(register(X86RegisterId.rax));
 		if (op.mem.base.id != X86RegisterId.invalid && op.mem.index.id == X86RegisterId.invalid && op.size == register(op.mem.base.id).size) {
-			writeln(new Expression(register(op.mem.base.id), Operator.INDEXED, new Expression(new Atomic(op.mem.disp, op.size, false, AtomicTypes.GLOBAL))));
 			return new Expression(register(op.mem.base.id), Operator.INDEXED, new Expression(new Atomic(op.mem.disp, op.size, false, AtomicTypes.GLOBAL)));
 		}
 	}
@@ -250,7 +287,7 @@ void main(string[] argv) {
 	lowWords = [X86RegisterId.eax : X86RegisterId.ax];
 	instrOperators = [X86InstructionId.add : Operator.ADD, X86InstructionId.sub : Operator.SUBTRACT, X86InstructionId.xor : Operator.XOR, X86InstructionId.cdqe : Operator.SIGNEXTEND, X86InstructionId.imul : Operator.MULTIPLY];
 	foreach (inst; assembly) {
-		writefln!"%10x: %-20s %-8s %s"(inst.address, inst.bytes().map!(a => format!"%02x"(a)).join(' '), inst.mnemonic(), inst.opStr());
+		writefln!"%10x: %-30s %-8s %s"(inst.address, inst.bytes().map!(a => format!"%02x"(a)).join(' '), inst.mnemonic(), inst.opStr());
 		curAddress = inst.address + inst.bytes().length;
 		switch(inst.idAsInt()) {
 			case X86InstructionId.mov:
@@ -314,7 +351,6 @@ void main(string[] argv) {
 				}
 				decomp ~= new FunctionCallStatement(fxcall, tempNum, args);
 				toOp(X86RegisterId.rax, new Expression(new Atomic(tempNum, 8, false, AtomicTypes.TEMPORARY)));
-				writeln(register(X86RegisterId.eax));
 				break;
 			case X86InstructionId.ret:
 				decomp ~= new ReturnStatement(register(X86RegisterId.rax));
@@ -345,5 +381,5 @@ void main(string[] argv) {
 		}
 	}
 	writeln("\n-----------------\n");
-	writeln(decomp.map!(to!string).join('\n'));
+	writeln(decomp.map!(to!string).filter!(a => a.length).join('\n'));
 }
