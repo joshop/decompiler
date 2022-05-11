@@ -154,7 +154,9 @@ class Expression {
 }
 string[] decompStr;
 class Statement {
-	
+	Statement dup() {
+		assert(0);
+	}
 }
 class AssignStatement : Statement {
 	Expression destination;
@@ -271,6 +273,134 @@ Expression register(X86RegisterId reg) {
 Expression[] stack;
 int usedTemps = 0;
 ulong[] readTemps;
+Expression cmpExpression1, cmpExpression2;
+enum JumpCondition {
+	UNCONDITIONAL,
+	LESS,
+	GREATER,
+	LESSEQUAL,
+	GREATEREQUAL,
+	EQUAL,
+	NOTEQUAL
+}
+class Unfinished {
+	X86Instruction[] pre;
+	Statement[] post;
+	bool finished;
+	this (X86Instruction[] pre, Statement[] post) {
+		this.pre = pre;
+		this.post = post;
+	}
+	this () {
+		
+	}
+	void debugPrint() {
+		foreach (inst; pre) {
+			writefln!"%10x: %-30s %-8s %s"(inst.address, inst.bytes().map!(a => format!"%02x"(a)).join(' '), inst.mnemonic(), inst.opStr());
+		}
+	}
+}
+class UnfinishedIfElse : Unfinished {
+	X86Instruction[] elsePre;
+	Statement[] elsePost;
+	JumpCondition condition;
+	this (Unfinished doIf, Unfinished doElse, JumpCondition condition) {
+		pre = doIf.pre.dup;
+		elsePre = doElse.pre.dup;
+		this.condition = condition;
+	}
+	override void debugPrint() {
+		writefln!"if (%s) {"(condition);
+		super.debugPrint();
+		writefln!"} else {";
+		foreach (inst; elsePre) {
+			writefln!"%10x: %-30s %-8s %s"(inst.address, inst.bytes().map!(a => format!"%02x"(a)).join(' '), inst.mnemonic(), inst.opStr());
+		}
+		writefln!"}";
+	}
+}
+class UnfinishedPair : Unfinished {
+	Unfinished after;
+	Unfinished before;
+	this (Unfinished first, Unfinished second) {
+		before = first;
+		after = second;
+	}
+	override void debugPrint() {
+		before.debugPrint();
+		after.debugPrint();
+	}
+}
+class Cfg {
+	Cfg ifTrue;
+	Cfg ifFalse;
+	ulong addressIfTrue;
+	ulong addressIfFalse;
+	ulong address;
+	Unfinished code;
+	JumpCondition cond;
+	ulong index;
+	this(X86Instruction[] code, JumpCondition cond, ulong address) {
+		this.code = new Unfinished(code, []);
+		this.cond = cond;
+		ifTrue = null;
+		ifFalse = null;
+		this.address = address;
+		index = cfg.length + 1;
+	}
+	void bifurcate(ulong along) {
+		Cfg lower = new Cfg([], cond, along);
+		X86Instruction[] myNew;
+		foreach (inst; code.pre) {
+			if (inst.address >= along) {
+				lower.code.pre ~= inst;
+			} else {
+				myNew ~= inst;
+			}
+		}
+		code.pre = myNew;
+		lower.addressIfTrue = addressIfTrue;
+		lower.addressIfFalse = addressIfFalse;
+		addressIfTrue = along;
+		cond = JumpCondition.UNCONDITIONAL;
+		cfg ~= lower;
+	}
+	bool bodyContainsAddr(ulong addr) {
+		ulong cur = address;
+		foreach (inst; code.pre) {
+			cur += inst.bytes().length;
+			if (cur == addr) return true;
+		}
+		return false;
+	}
+	bool performIfElseTransform() {
+		// conditions for ifElseTransform
+		// - ifTrue and ifFalse are both unconditional
+		// - ifTrue and ifFalse both have the same ifTrue
+		if (ifTrue is null || ifFalse is null) return false;
+		if (ifTrue.cond != JumpCondition.UNCONDITIONAL || ifFalse.cond != JumpCondition.UNCONDITIONAL || ifTrue.ifTrue != ifFalse.ifTrue) return false;
+		UnfinishedIfElse end = new UnfinishedIfElse(ifTrue.code, ifFalse.code, cond);
+		cond = JumpCondition.UNCONDITIONAL;
+		ifTrue.code = end;
+		ifFalse.index = 0;
+		ifFalse = null;
+		return true;
+	}
+	bool performBlockTransform() {
+		// conditions for blockTransform
+		// - this is unconditional
+		if (ifTrue is null) return false;
+		if (cond != JumpCondition.UNCONDITIONAL) return false;
+		UnfinishedPair end = new UnfinishedPair(code, ifTrue.code);
+		code = end;
+		ifTrue.index = 0;
+		cond = ifTrue.cond;
+		ifFalse = ifTrue.ifFalse;
+		ifTrue = ifTrue.ifTrue;
+		return true;
+	}
+}
+Cfg[] cfg;
 void main(string[] argv) {
 	ELF elf = ELF.fromFile(argv[1]);
 	ELFSection sec = elf.getSection(".symtab").get;
@@ -286,6 +416,72 @@ void main(string[] argv) {
 	lowLongs = [X86RegisterId.rax : X86RegisterId.eax, X86RegisterId.rdi : X86RegisterId.edi, X86RegisterId.rsi : X86RegisterId.esi, X86RegisterId.rdx : X86RegisterId.edx];
 	lowWords = [X86RegisterId.eax : X86RegisterId.ax];
 	instrOperators = [X86InstructionId.add : Operator.ADD, X86InstructionId.sub : Operator.SUBTRACT, X86InstructionId.xor : Operator.XOR, X86InstructionId.cdqe : Operator.SIGNEXTEND, X86InstructionId.imul : Operator.MULTIPLY];
+	Cfg curCfg = new Cfg([], JumpCondition.UNCONDITIONAL, symbol.value);
+	X86Instruction[] buffer;
+	JumpCondition[X86InstructionId] jumpTypes = [X86InstructionId.jle : JumpCondition.LESSEQUAL, X86InstructionId.jmp : JumpCondition.UNCONDITIONAL];
+	foreach (inst; assembly) {
+		if (cast(X86InstructionId)inst.idAsInt() in jumpTypes) {
+			curCfg.cond = jumpTypes[cast(X86InstructionId)inst.idAsInt()];
+			ulong jumpTarget = inst.detail().operands.front.imm;
+			curCfg.addressIfTrue = jumpTarget;
+			curCfg.addressIfFalse = inst.address + inst.bytes().length;
+			cfg ~= curCfg;
+			curCfg = new Cfg([], JumpCondition.UNCONDITIONAL, inst.address + inst.bytes().length);
+		} else {
+			curCfg.code.pre ~= inst;
+		}
+	}
+	cfg ~= curCfg;
+	foreach (node; cfg) {
+		auto needSplit = cfg.find!(a => a.bodyContainsAddr(node.addressIfTrue));
+		if (!needSplit.empty) needSplit.front.bifurcate(node.addressIfTrue);
+		if (node.cond == JumpCondition.UNCONDITIONAL) break;
+		needSplit = cfg.find!(a => a.bodyContainsAddr(node.addressIfFalse));
+		if (!needSplit.empty) needSplit.front.bifurcate(node.addressIfFalse);
+	}
+	foreach (node; cfg) {
+		foreach (other; cfg) {
+			if (other.address == node.addressIfTrue) node.ifTrue = other;
+			if (other.address == node.addressIfFalse) node.ifFalse = other;
+		}
+	}
+	outer: while (true) {
+		cfg = cfg.filter!(a => a.index).array;
+		/*foreach (node; cfg) {
+			writefln!"------------------------------";
+			writefln!"Cfg node %d at %x"(node.index, node.address);
+			if (node.cond == JumpCondition.UNCONDITIONAL) {
+				writefln!"Always %x"(node.ifTrue is null ? 0 : node.ifTrue.address);
+			} else {
+				writefln!"If %s, %x else %x"(node.cond, node.ifTrue is null ? 0 : node.ifTrue.address, node.ifFalse is null ? 0 : node.ifFalse.address);
+			}
+			writefln!"------------------------------";
+			node.code.debugPrint();
+			writefln!"------------------------------\n";
+		}*/
+		// attempt ifelse
+		foreach (index; 0..cfg.length) {
+			if (cfg[index].performIfElseTransform()) continue outer;
+		}
+		// attempt block
+		foreach (index; 0..cfg.length) {
+			if (cfg[index].performBlockTransform()) continue outer;
+		}
+		break;
+	}
+	foreach (node; cfg) {
+		writefln!"------------------------------";
+		writefln!"Cfg node %d at %x"(node.index, node.address);
+		if (node.cond == JumpCondition.UNCONDITIONAL) {
+			writefln!"Always %x"(node.ifTrue is null ? 0 : node.ifTrue.address);
+		} else {
+			writefln!"If %s, %x else %x"(node.cond, node.ifTrue is null ? 0 : node.ifTrue.address, node.ifFalse is null ? 0 : node.ifFalse.address);
+		}
+		writefln!"------------------------------";
+		node.code.debugPrint();
+		writefln!"------------------------------\n";
+	}
+	return;
 	foreach (inst; assembly) {
 		writefln!"%10x: %-30s %-8s %s"(inst.address, inst.bytes().map!(a => format!"%02x"(a)).join(' '), inst.mnemonic(), inst.opStr());
 		curAddress = inst.address + inst.bytes().length;
@@ -375,8 +571,14 @@ void main(string[] argv) {
 			case X86InstructionId.leave:
 			case X86InstructionId.endbr64:
 				break;
+			case X86InstructionId.cmp:
+				auto opSources = inst.detail().operands.filter!(a => a.access & AccessType.read || a.type == X86OpType.imm).array;
+				assert(opSources.length == 2);
+				cmpExpression1 = fromOp(opSources[0]);
+				cmpExpression2 = fromOp(opSources[1]);
+				break;
 			default: 
-			writefln!"No instruction: %d"(inst.idAsInt());
+			writefln!"No instruction: %s"(inst.mnemonic);
 			assert(0);
 		}
 	}

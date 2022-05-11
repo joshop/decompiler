@@ -1,7 +1,12 @@
 #include <stdio.h>
 
 int main() {
-	int var1 = 10;
-	int var2 = var1++;
-	printf("%d %d\n", var1, var2);
+	int x = 5;
+	int t = 1;
+	if (x > 6) {
+		t++;
+	} else {
+		t--;
+	}
+	return t;
 }
