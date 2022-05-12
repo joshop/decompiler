@@ -108,6 +108,7 @@ class Expression {
 		if (op == Operator.CAST) return "(" ~ atomic.typename() ~ ") " ~ left.toString();
 		if (op == Operator.INDEXED) return left.toString() ~ "[" ~ right.toString() ~ "]";
 		if (right is null) return opTexts[op] ~ " " ~ (precedenceOver(left.op, op) ? "(" : "") ~ left.toString() ~ (precedenceOver(left.op, op) ? ")" : "");
+		if (left is null) assert(0);
 		return (precedenceOver(left.op, op) ? "(" : "") ~ left.toString() ~ (precedenceOver(left.op, op) ? ")" : "") ~ " " ~ opTexts[op] ~ " " ~ (precedenceOver(right.op, op) ? "(" : "") ~ right.toString() ~ (precedenceOver(right.op, op) ? ")" : "");
 	}
 	@property bool isPointer() {
@@ -178,7 +179,7 @@ class AssignStatement : Statement {
 		}
 	}
 	override string toString() {
-		return "\t".replicate(indentation) ~ destination.toString() ~ " = " ~ source.toString() ~ ";";
+		return "\t".replicate(indentation) ~ destination.toString() ~ " = " ~ source.toString() ~ ";\n";
 	}
 }
 class FunctionCallStatement : Statement {
@@ -191,7 +192,7 @@ class FunctionCallStatement : Statement {
 		this.args = args;
 	}
 	override string toString() {
-		return "\t".replicate(indentation) ~ (readTemps.canFind(temp) ? "temp" ~ temp.to!string ~ " = " : "") ~ fxname ~ "(" ~ args.map!(to!string).join(", ") ~ ");";
+		return "\t".replicate(indentation) ~ (readTemps.canFind(temp) ? "temp" ~ temp.to!string ~ " = " : "") ~ fxname ~ "(" ~ args.map!(to!string).join(", ") ~ ");\n";
 	}
 }
 class ReturnStatement : Statement {
@@ -200,7 +201,7 @@ class ReturnStatement : Statement {
 		this.value = value;
 	}
 	override string toString() {
-		return "\t".replicate(indentation) ~ "return " ~ value.to!string ~ ";";
+		return "\t".replicate(indentation) ~ "return " ~ value.to!string ~ ";\n";
 	}
 }
 class TempBackupStatement : Statement {
@@ -211,7 +212,7 @@ class TempBackupStatement : Statement {
 		this.temp = temp;
 	}
 	override string toString() {
-		if (readTemps.canFind(temp)) return "\t".replicate(indentation) ~ "temp" ~ temp.to!string ~ " = " ~ source.toString() ~ ";";
+		if (readTemps.canFind(temp)) return "\t".replicate(indentation) ~ "temp" ~ temp.to!string ~ " = " ~ source.toString() ~ ";\n";
 		return "";
 	}
 }
@@ -242,7 +243,7 @@ Expression fromOp(const(X86Op) op) {
 		}
 		if (op.mem.base.id != X86RegisterId.invalid && op.mem.index.id == X86RegisterId.invalid && (1 || op.size == register(op.mem.base.id).size)) {
 			if (op.mem.disp) {
-				return new Expression(register(op.mem.base.id), Operator.INDEXED, new Expression(new Atomic(op.mem.disp, op.size, false, AtomicTypes.GLOBAL)));
+				return new Expression(register(op.mem.base.id), Operator.INDEXED, new Expression(new Atomic(op.mem.disp/op.size, op.size, false, AtomicTypes.GLOBAL)));
 			} else {
 				return new Expression(register(op.mem.base.id), Operator.DEREFERENCE, null);
 			}
@@ -272,12 +273,33 @@ void toOp(X86RegisterId id, Expression from) {
 }
 X86RegisterId[X86RegisterId] lowLongs;
 X86RegisterId[X86RegisterId] lowWords;
+X86RegisterId[X86RegisterId] lowBytes;
+X86RegisterId[X86RegisterId] highBytes;
 Operator[X86InstructionId] instrOperators;
 Expression register(X86RegisterId reg) {
-	if (reg in state) return state[reg];
-	if (reg in lowLongs && lowLongs[reg] in state) return state[lowLongs[reg]];
+	/* (reg in lowLongs && lowLongs[reg] in state) return state[lowLongs[reg]];
 	if (reg in lowWords && lowWords[reg] in state) return state[lowWords[reg]];
 	if (reg in lowLongs && lowLongs[reg] in lowWords && lowWords[lowLongs[reg]] in state) return state[lowWords[lowLongs[reg]]];
+	if (reg in lowBytes && lowBytes[reg] in state) return state[lowBytes[reg]];
+	if (reg in highBytes && highBytes[reg] in state) return state[highBytes[reg]];
+	if (*/
+	if (registerLow(reg) !is null) return registerLow(reg);
+	if (registerHigh(reg) !is null) return registerHigh(reg);
+	return null;
+}
+Expression registerLow(X86RegisterId reg) {
+	if (reg in state) return state[reg];
+	if (reg in lowLongs && registerLow(lowLongs[reg]) !is null) return registerLow(lowLongs[reg]);
+	if (reg in lowWords && registerLow(lowWords[reg]) !is null) return registerLow(lowWords[reg]);
+	if (reg in lowBytes && registerLow(lowBytes[reg]) !is null) return registerLow(lowBytes[reg]);
+	if (reg in highBytes && registerLow(highBytes[reg]) !is null) return registerLow(highBytes[reg]);
+	return null;
+}
+Expression registerHigh(X86RegisterId reg) {
+	if (reg in state) return state[reg];
+	if (lowBytes.byValue.canFind(reg) && registerHigh(lowBytes.byKeyValue.find!(a => a.value == reg).front.key) !is null) return registerHigh(lowBytes.byKeyValue.find!(a => a.value == reg).front.key);
+	if (lowWords.byValue.canFind(reg) && registerHigh(lowWords.byKeyValue.find!(a => a.value == reg).front.key) !is null) return registerHigh(lowWords.byKeyValue.find!(a => a.value == reg).front.key);
+	if (lowLongs.byValue.canFind(reg) && registerHigh(lowLongs.byKeyValue.find!(a => a.value == reg).front.key) !is null) return registerHigh(lowLongs.byKeyValue.find!(a => a.value == reg).front.key);
 	return null;
 }
 Expression[] stack;
@@ -315,6 +337,8 @@ class Unfinished {
 			curAddress = inst.address + inst.bytes().length;
 			switch(inst.idAsInt()) {
 				case X86InstructionId.mov:
+				case X86InstructionId.movzx:
+				case X86InstructionId.movsx: // this is a problem and needs to be fixed
 					// mov
 					// source: register, immediate, or memory
 					Expression source;
@@ -323,6 +347,7 @@ class Unfinished {
 					source = fromOp(opSources.front);
 					if (source !is null) source.beUsed();
 					auto opDests = inst.detail().operands.filter!(a => a.access & AccessType.write).array;
+					writeln(opDests.front, " ", source);
 					toOp(opDests.front, source);
 					break;
 				case X86InstructionId.add:
@@ -419,7 +444,7 @@ class Unfinished {
 	override string toString() {
 		string result;
 		foreach (stmt; post) {
-			result ~= stmt.toString() ~ "\n";
+			result ~= stmt.toString();
 		}
 		return result;
 	}
@@ -500,6 +525,40 @@ class UnfinishedIf : Unfinished {
 	}
 	override string toString() {
 		return "\t".replicate(indent) ~ "if (" ~ left.toString() ~ " " ~ jumpCondOps[condition] ~ " " ~ right.toString() ~ ") {\n" ~ doIf.toString() ~ "\t".replicate(indent) ~ "}\n" ;
+	}
+}
+class UnfinishedWhile : Unfinished {
+	Unfinished doWhile;
+	Expression left;
+	Expression right;
+	JumpCondition condition;
+	int indent;
+	this (Unfinished doWhile, JumpCondition condition) {
+		this.doWhile = doWhile;
+		this.condition = condition;
+	}
+	override void debugPrint() {
+		writefln!"while (%s) {"(condition);
+		doWhile.debugPrint();
+		writefln!"}";
+	}
+	override void decompile (int indentation = 0) {
+		left = cmpExpression1;
+		right = cmpExpression2;
+		int[X86RegisterId] whichTemps;
+		doWhile.decompile(indentation + 1);
+		foreach (reg; state.byKey) { // TODO: this shouldn't work
+			if (state[reg] is null) continue;
+			whichTemps[reg] = usedTemps++;
+		}
+		foreach (reg; whichTemps.byKey) {
+			doWhile.post ~= new TempBackupStatement(state[reg], whichTemps[reg]);
+			state[reg] = new Expression(new Atomic(whichTemps[reg], 8, false, AtomicTypes.TEMPORARY));
+		}
+		indent = indentation;
+	}
+	override string toString() {
+		return "\t".replicate(indent) ~ "while (" ~ left.toString() ~ " " ~ jumpCondOps[condition] ~ " " ~ right.toString() ~ ") {\n" ~ doWhile.toString() ~ "\t".replicate(indent) ~ "}\n" ;
 	}
 }
 class UnfinishedPair : Unfinished {
@@ -605,6 +664,34 @@ class Cfg {
 		}
 		return false;
 	}
+	bool performWhileTransform() {
+		// conditions for whileTransform
+		// - this is not unconditional
+		// - EITHER
+		//    - isTrue.isTrue == isTrue and isTrue.isFalse is isFalse
+		// - OR
+		//    - isFalse.isFalse == isFalse and isFalse.isTrue is isTrue
+		if (cond == JumpCondition.UNCONDITIONAL) return false;
+		if (ifTrue is null || ifFalse is null) return false;
+		if (ifTrue.ifTrue == ifTrue && ifTrue.ifFalse == ifFalse) {
+			UnfinishedWhile end = new UnfinishedWhile(ifTrue.code, cond);
+			cond = JumpCondition.UNCONDITIONAL;
+			ifTrue.ifTrue = ifFalse;
+			ifTrue.code = end;
+			ifTrue.cond = JumpCondition.UNCONDITIONAL;
+			return true;
+		}
+		if (ifFalse.ifFalse == ifFalse && ifFalse.ifTrue == ifTrue) {
+			UnfinishedWhile end = new UnfinishedWhile(ifFalse.code, cond);
+			cond = JumpCondition.UNCONDITIONAL;
+			ifFalse.ifFalse = ifTrue;
+			ifFalse.code = end;
+			ifFalse.cond = JumpCondition.UNCONDITIONAL;
+			return true;
+		}
+		return false;
+	}
+		
 	bool performBlockTransform() {
 		// conditions for blockTransform
 		// - this is unconditional
@@ -636,6 +723,8 @@ void main(string[] argv) {
 	opTexts = [Operator.ADD: "+", Operator.SUBTRACT: "-", Operator.XOR: "^", Operator.ATOMIC: " ", Operator.SIGNEXTEND: "signextend", Operator.ADDRESS: "address", Operator.MULTIPLY: "*", Operator.DEREFERENCE : "*"];
 	lowLongs = [X86RegisterId.rax : X86RegisterId.eax, X86RegisterId.rdi : X86RegisterId.edi, X86RegisterId.rsi : X86RegisterId.esi, X86RegisterId.rdx : X86RegisterId.edx];
 	lowWords = [X86RegisterId.eax : X86RegisterId.ax];
+	lowBytes = [X86RegisterId.ax : X86RegisterId.al];
+	highBytes = [X86RegisterId.ax : X86RegisterId.ah];
 	instrOperators = [X86InstructionId.add : Operator.ADD, X86InstructionId.sub : Operator.SUBTRACT, X86InstructionId.xor : Operator.XOR, X86InstructionId.cdqe : Operator.SIGNEXTEND, X86InstructionId.imul : Operator.MULTIPLY];
 	Cfg curCfg = new Cfg([], JumpCondition.UNCONDITIONAL, symbol.value);
 	X86Instruction[] buffer;
@@ -669,8 +758,24 @@ void main(string[] argv) {
 			if (other.address == node.addressIfFalse) node.ifFalse = other;
 		}
 	}
+	foreach (node; cfg) {
+		writefln!"------------------------------";
+		writefln!"Cfg node %d at %x"(node.index, node.address);
+		if (node.cond == JumpCondition.UNCONDITIONAL) {
+			writefln!"Always %x"(node.ifTrue is null ? 0 : node.ifTrue.address);
+		} else {
+			writefln!"If %s, %x else %x"(node.cond, node.ifTrue is null ? 0 : node.ifTrue.address, node.ifFalse is null ? 0 : node.ifFalse.address);
+		}
+		writefln!"------------------------------";
+		node.code.debugPrint();
+		writefln!"------------------------------\n";
+	}
 	restartTransformLoop:
 		cfg = cfg.filter!(a => a.index != 0).array;
+		// attempt while
+		foreach (index; 0..cfg.length) {
+			if (cfg[index].performWhileTransform()) goto restartTransformLoop;
+		}
 		// attempt ifelse
 		foreach (index; 0..cfg.length) {
 			if (cfg[index].performIfElseTransform()) goto restartTransformLoop;
@@ -684,18 +789,7 @@ void main(string[] argv) {
 			if (cfg[index].performBlockTransform()) goto restartTransformLoop;
 		}
 	
-	foreach (node; cfg) {
-		writefln!"------------------------------";
-		writefln!"Cfg node %d at %x"(node.index, node.address);
-		if (node.cond == JumpCondition.UNCONDITIONAL) {
-			writefln!"Always %x"(node.ifTrue is null ? 0 : node.ifTrue.address);
-		} else {
-			writefln!"If %s, %x else %x"(node.cond, node.ifTrue is null ? 0 : node.ifTrue.address, node.ifFalse is null ? 0 : node.ifFalse.address);
-		}
-		writefln!"------------------------------";
-		node.code.debugPrint();
-		writefln!"------------------------------\n";
-	}
+	
 	assert(cfg.length == 1);
 	cfg.front.code.decompile();
 	writeln(cfg.front.code.toString);

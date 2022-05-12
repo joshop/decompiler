@@ -1,7 +1,10 @@
 int main(){
-  int n = 0;
-  int* p = &n;
-  *p = 1;
-  if(*p == n){return 1;}
-  return 0;
+	int x = 10;
+	int s = 4;
+	while (x) {
+		if (x > 4)
+		s += x;
+		x--;
+	}
+	return s;
 }
