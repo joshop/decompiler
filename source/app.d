@@ -154,8 +154,13 @@ class Expression {
 }
 string[] decompStr;
 class Statement {
+	int indentation;
 	Statement dup() {
 		assert(0);
+	}
+	Statement indentBy(int indent) {
+		indentation = indent;
+		return this;
 	}
 }
 class AssignStatement : Statement {
@@ -173,7 +178,7 @@ class AssignStatement : Statement {
 		}
 	}
 	override string toString() {
-		return destination.toString() ~ " = " ~ source.toString() ~ ";";
+		return "\t".replicate(indentation) ~ destination.toString() ~ " = " ~ source.toString() ~ ";";
 	}
 }
 class FunctionCallStatement : Statement {
@@ -186,7 +191,7 @@ class FunctionCallStatement : Statement {
 		this.args = args;
 	}
 	override string toString() {
-		return (readTemps.canFind(temp) ? "temp" ~ temp.to!string ~ " = " : "") ~ fxname ~ "(" ~ args.map!(to!string).join(", ") ~ ");";
+		return "\t".replicate(indentation) ~ (readTemps.canFind(temp) ? "temp" ~ temp.to!string ~ " = " : "") ~ fxname ~ "(" ~ args.map!(to!string).join(", ") ~ ");";
 	}
 }
 class ReturnStatement : Statement {
@@ -195,7 +200,7 @@ class ReturnStatement : Statement {
 		this.value = value;
 	}
 	override string toString() {
-		return "return " ~ value.to!string ~ ";";
+		return "\t".replicate(indentation) ~ "return " ~ value.to!string ~ ";";
 	}
 }
 class TempBackupStatement : Statement {
@@ -206,7 +211,7 @@ class TempBackupStatement : Statement {
 		this.temp = temp;
 	}
 	override string toString() {
-		if (readTemps.canFind(temp)) return "temp" ~ temp.to!string ~ " = " ~ source.toString() ~ ";";
+		if (readTemps.canFind(temp)) return "\t".replicate(indentation) ~ "temp" ~ temp.to!string ~ " = " ~ source.toString() ~ ";";
 		return "";
 	}
 }
@@ -235,9 +240,14 @@ Expression fromOp(const(X86Op) op) {
 		if (op.mem.base.id != X86RegisterId.invalid && op.mem.index.id != X86RegisterId.invalid && op.size == state[op.mem.base.id].size) {
 			return new Expression(state[op.mem.base.id], Operator.INDEXED, state[op.mem.index.id]);
 		}
-		if (op.mem.base.id != X86RegisterId.invalid && op.mem.index.id == X86RegisterId.invalid && op.size == register(op.mem.base.id).size) {
-			return new Expression(register(op.mem.base.id), Operator.INDEXED, new Expression(new Atomic(op.mem.disp, op.size, false, AtomicTypes.GLOBAL)));
+		if (op.mem.base.id != X86RegisterId.invalid && op.mem.index.id == X86RegisterId.invalid && (1 || op.size == register(op.mem.base.id).size)) {
+			if (op.mem.disp) {
+				return new Expression(register(op.mem.base.id), Operator.INDEXED, new Expression(new Atomic(op.mem.disp, op.size, false, AtomicTypes.GLOBAL)));
+			} else {
+				return new Expression(register(op.mem.base.id), Operator.DEREFERENCE, null);
+			}
 		}
+		writefln!"base %s index %s displacement %d size %d"(op.mem.base.id, op.mem.index.id, op.mem.disp, op.size);
 	}
 	assert(0);
 }
@@ -286,7 +296,6 @@ enum JumpCondition {
 class Unfinished {
 	X86Instruction[] pre;
 	Statement[] post;
-	bool finished;
 	this (X86Instruction[] pre, Statement[] post) {
 		this.pre = pre;
 		this.post = post;
@@ -299,24 +308,198 @@ class Unfinished {
 			writefln!"%10x: %-30s %-8s %s"(inst.address, inst.bytes().map!(a => format!"%02x"(a)).join(' '), inst.mnemonic(), inst.opStr());
 		}
 	}
+	void decompile(int indentation = 0) {
+		decomp = [];
+		foreach (inst; pre) {
+			writefln!"%10x: %-30s %-8s %s"(inst.address, inst.bytes().map!(a => format!"%02x"(a)).join(' '), inst.mnemonic(), inst.opStr());
+			curAddress = inst.address + inst.bytes().length;
+			switch(inst.idAsInt()) {
+				case X86InstructionId.mov:
+					// mov
+					// source: register, immediate, or memory
+					Expression source;
+					auto opSources = inst.detail().operands.filter!(a => a.access & AccessType.read || a.type == X86OpType.imm).array;
+					assert(opSources.length == 1);
+					source = fromOp(opSources.front);
+					if (source !is null) source.beUsed();
+					auto opDests = inst.detail().operands.filter!(a => a.access & AccessType.write).array;
+					toOp(opDests.front, source);
+					break;
+				case X86InstructionId.add:
+				case X86InstructionId.sub:
+				case X86InstructionId.xor:
+				case X86InstructionId.imul:
+					auto opSources = inst.detail().operands.filter!(a => a.access & AccessType.read || a.type == X86OpType.imm).array;
+					assert(opSources.length == 2);
+					Expression source1 = fromOp(opSources.front);
+					if (source1 !is null) source1.beUsed();
+					Expression source2 = fromOp(opSources[1]);
+					if (source2 !is null) source2.beUsed();
+					auto opDests = inst.detail().operands.filter!(a => a.access & AccessType.write).array;
+					if (inst.idAsInt() == X86InstructionId.imul) {
+						auto temp = source1;
+						source1 = source2;
+						source2 = temp;
+					}
+					if (inst.idAsInt() == X86InstructionId.xor && source1 == source2) {
+						toOp(opDests.front, new Expression(new Atomic(0, opSources.front.size, false, AtomicTypes.GLOBAL)));
+					} else {
+						toOp(opDests.front, new Expression(source2, instrOperators[cast(X86InstructionId)inst.idAsInt()], source1));
+					}
+					break;
+				case X86InstructionId.lea:
+					Expression source;
+					auto opSources = inst.detail().operands.filter!(a => a.access & AccessType.read || a.type == X86OpType.imm).array;
+					assert(opSources.length == 1);
+					source = fromOp(opSources.front);
+					if (!source.isPointer) {
+						source = new Expression(source, Operator.ADDRESS, null);
+					}
+					source.isPointer = false;
+					auto opDests = inst.detail().operands.filter!(a => a.access & AccessType.write).array;
+					toOp(opDests.front, source);
+					break;
+				case X86InstructionId.call:
+					int tempNum = usedTemps++;
+					auto fx = SymbolTable(sec).symbols().find!(a => a.value == inst.detail().operands[0].imm);
+					string fxcall;
+					if (fx.empty || fx.front.type != 2) {
+						fxcall = "func_" ~ inst.detail().operands[0].imm.to!string(16);
+					} else {
+						fxcall = fx.front.name;
+					}
+					Expression[] args;
+					foreach(argReg; [X86RegisterId.rdi, X86RegisterId.rsi, X86RegisterId.rdx]) {
+						if (register(argReg) is null) break;
+						args ~= register(argReg);
+					}
+					decomp ~= new FunctionCallStatement(fxcall, tempNum, args);
+					toOp(X86RegisterId.rax, new Expression(new Atomic(tempNum, 8, false, AtomicTypes.TEMPORARY)));
+					break;
+				case X86InstructionId.ret:
+					register(X86RegisterId.rax).beUsed();
+					decomp ~= new ReturnStatement(register(X86RegisterId.rax));
+					break;
+				case X86InstructionId.push:
+					Expression source;
+					auto opSources = inst.detail().operands.filter!(a => a.access & AccessType.read || a.type == X86OpType.imm).array;
+					assert(opSources.length == 1);
+					source = fromOp(opSources.front);
+					stack ~= source;
+					break;
+				case X86InstructionId.pop:
+					auto opDests = inst.detail().operands.filter!(a => a.access & AccessType.write).array;
+					toOp(opDests.front, stack[$-1]);
+					stack.remove(stack.length-1);
+					break;
+				case X86InstructionId.cdqe:
+					Expression source = state[X86RegisterId.rax];
+					auto opDests = inst.detail().operands.filter!(a => a.access & AccessType.write).array;
+					toOp(X86RegisterId.rax, new Expression(source, instrOperators[cast(X86InstructionId)inst.idAsInt()], null));
+					break;
+				case X86InstructionId.leave:
+				case X86InstructionId.endbr64:
+					break;
+				case X86InstructionId.cmp:
+					auto opSources = inst.detail().operands.filter!(a => a.access & AccessType.read || a.type == X86OpType.imm).array;
+					assert(opSources.length == 2);
+					cmpExpression1 = fromOp(opSources[1]);
+					cmpExpression2 = fromOp(opSources[0]);
+					break;
+				default: 
+				writefln!"No instruction: %s"(inst.mnemonic);
+				assert(0);
+			}
+		}
+		foreach(stmt; 0..decomp.length) {
+			decomp[stmt].indentBy(indentation);
+		}
+		post = decomp.dup;
+	}
+	override string toString() {
+		string result;
+		foreach (stmt; post) {
+			result ~= stmt.toString() ~ "\n";
+		}
+		return result;
+	}
 }
 class UnfinishedIfElse : Unfinished {
-	X86Instruction[] elsePre;
-	Statement[] elsePost;
+	Unfinished doIf;
+	Unfinished doElse;
+	Expression left;
+	Expression right;
 	JumpCondition condition;
+	int indent;
 	this (Unfinished doIf, Unfinished doElse, JumpCondition condition) {
-		pre = doIf.pre.dup;
-		elsePre = doElse.pre.dup;
+		this.doIf = doIf;
+		this.doElse = doElse;
 		this.condition = condition;
 	}
 	override void debugPrint() {
 		writefln!"if (%s) {"(condition);
-		super.debugPrint();
+		doIf.debugPrint();
 		writefln!"} else {";
-		foreach (inst; elsePre) {
-			writefln!"%10x: %-30s %-8s %s"(inst.address, inst.bytes().map!(a => format!"%02x"(a)).join(' '), inst.mnemonic(), inst.opStr());
-		}
+		doElse.debugPrint();
 		writefln!"}";
+	}
+	override void decompile (int indentation = 0) {
+		left = cmpExpression1;
+		right = cmpExpression2;
+		auto oldState = state.dup;
+		int[X86RegisterId] whichTemps;
+		doIf.decompile(indentation + 1);
+		foreach (reg; state.byKey) {
+			if (state[reg] is null) continue;
+			whichTemps[reg] = usedTemps++;
+		}
+		foreach (reg; whichTemps.byKey) {
+			doIf.post ~= new TempBackupStatement(state[reg], whichTemps[reg]).indentBy(indentation+1);
+		}
+		state = oldState;
+		doElse.decompile(indentation + 1);
+		foreach (reg; whichTemps.byKey) {
+			doElse.post ~= new TempBackupStatement(state[reg], whichTemps[reg]).indentBy(indentation+1);
+			state[reg] = new Expression(new Atomic(whichTemps[reg], 8, false, AtomicTypes.TEMPORARY));
+		}
+		indent = indentation;
+	}
+	override string toString() {
+		return "\t".replicate(indent) ~ "if (" ~ left.toString() ~ " " ~ jumpCondOps[condition] ~ " " ~ right.toString() ~ ") {\n" ~ doIf.toString() ~ "\t".replicate(indent) ~ "} else {\n" ~ doElse.toString() ~ "\t".replicate(indent) ~ "}\n" ;
+	}
+}
+class UnfinishedIf : Unfinished {
+	Unfinished doIf;
+	Expression left;
+	Expression right;
+	JumpCondition condition;
+	int indent;
+	this (Unfinished doIf, JumpCondition condition) {
+		this.doIf = doIf;
+		this.condition = condition;
+	}
+	override void debugPrint() {
+		writefln!"if (%s) {"(condition);
+		doIf.debugPrint();
+		writefln!"}";
+	}
+	override void decompile (int indentation = 0) {
+		left = cmpExpression1;
+		right = cmpExpression2;
+		int[X86RegisterId] whichTemps;
+		doIf.decompile(indentation + 1);
+		foreach (reg; state.byKey) {
+			if (state[reg] is null) continue;
+			whichTemps[reg] = usedTemps++;
+		}
+		foreach (reg; whichTemps.byKey) {
+			doIf.post ~= new TempBackupStatement(state[reg], whichTemps[reg]);
+			state[reg] = new Expression(new Atomic(whichTemps[reg], 8, false, AtomicTypes.TEMPORARY));
+		}
+		indent = indentation;
+	}
+	override string toString() {
+		return "\t".replicate(indent) ~ "if (" ~ left.toString() ~ " " ~ jumpCondOps[condition] ~ " " ~ right.toString() ~ ") {\n" ~ doIf.toString() ~ "\t".replicate(indent) ~ "}\n" ;
 	}
 }
 class UnfinishedPair : Unfinished {
@@ -329,6 +512,13 @@ class UnfinishedPair : Unfinished {
 	override void debugPrint() {
 		before.debugPrint();
 		after.debugPrint();
+	}
+	override void decompile (int indentation = 0) {
+		before.decompile(indentation);
+		after.decompile(indentation);
+	}
+	override string toString() {
+		return before.toString() ~ after.toString();
 	}
 }
 class Cfg {
@@ -375,8 +565,10 @@ class Cfg {
 	}
 	bool performIfElseTransform() {
 		// conditions for ifElseTransform
+		// - this is not unconditional
 		// - ifTrue and ifFalse are both unconditional
 		// - ifTrue and ifFalse both have the same ifTrue
+		if (cond == JumpCondition.UNCONDITIONAL) return false;
 		if (ifTrue is null || ifFalse is null) return false;
 		if (ifTrue.cond != JumpCondition.UNCONDITIONAL || ifFalse.cond != JumpCondition.UNCONDITIONAL || ifTrue.ifTrue != ifFalse.ifTrue) return false;
 		UnfinishedIfElse end = new UnfinishedIfElse(ifTrue.code, ifFalse.code, cond);
@@ -385,6 +577,33 @@ class Cfg {
 		ifFalse.index = 0;
 		ifFalse = null;
 		return true;
+	}
+	bool performIfTransform() {
+		// conditions for ifTransform
+		// - this is not unconditional
+		// - EITHER
+		//    - ifTrue is unconditional and ifTrue.ifTrue == ifFalse
+		// - OR
+		//    - ifFalse is unconditional and ifFalse.ifTrue == ifTrue
+		if (cond == JumpCondition.UNCONDITIONAL) return false;
+		if (ifTrue is null || ifFalse is null) return false;
+		if (ifTrue.cond == JumpCondition.UNCONDITIONAL && ifTrue.ifTrue == ifFalse) {
+			UnfinishedIf end = new UnfinishedIf(ifTrue.code, cond);
+			cond = JumpCondition.UNCONDITIONAL;
+			ifTrue.code = end;
+			ifFalse.index = 0;
+			ifFalse = null;
+			return true;
+		}
+		if (ifFalse.cond == JumpCondition.UNCONDITIONAL && ifFalse.ifTrue == ifTrue) {
+			UnfinishedIf end = new UnfinishedIf(ifFalse.code, cond);
+			cond = JumpCondition.UNCONDITIONAL;
+			ifFalse.code = end;
+			ifTrue.index = 0;
+			ifTrue = null;
+			return true;
+		}
+		return false;
 	}
 	bool performBlockTransform() {
 		// conditions for blockTransform
@@ -401,9 +620,11 @@ class Cfg {
 	}
 }
 Cfg[] cfg;
+ELFSection sec;
+string[JumpCondition] jumpCondOps;
 void main(string[] argv) {
 	ELF elf = ELF.fromFile(argv[1]);
-	ELFSection sec = elf.getSection(".symtab").get;
+	sec = elf.getSection(".symtab").get;
 	ELFSymbol symbol = SymbolTable(sec).symbols().find!(a => a.name == argv[2]).front;
 	auto elfFile = File(argv[1]);
 	elfFile.seek(symbol.value);
@@ -412,13 +633,14 @@ void main(string[] argv) {
 	disasm.syntax = Syntax.att;
 	disasm.detail = true;
 	auto assembly = disasm.disasm(code, symbol.value);
-	opTexts = [Operator.ADD: "+", Operator.SUBTRACT: "-", Operator.XOR: "^", Operator.ATOMIC: " ", Operator.SIGNEXTEND: "signextend", Operator.ADDRESS: "address", Operator.MULTIPLY: "*"];
+	opTexts = [Operator.ADD: "+", Operator.SUBTRACT: "-", Operator.XOR: "^", Operator.ATOMIC: " ", Operator.SIGNEXTEND: "signextend", Operator.ADDRESS: "address", Operator.MULTIPLY: "*", Operator.DEREFERENCE : "*"];
 	lowLongs = [X86RegisterId.rax : X86RegisterId.eax, X86RegisterId.rdi : X86RegisterId.edi, X86RegisterId.rsi : X86RegisterId.esi, X86RegisterId.rdx : X86RegisterId.edx];
 	lowWords = [X86RegisterId.eax : X86RegisterId.ax];
 	instrOperators = [X86InstructionId.add : Operator.ADD, X86InstructionId.sub : Operator.SUBTRACT, X86InstructionId.xor : Operator.XOR, X86InstructionId.cdqe : Operator.SIGNEXTEND, X86InstructionId.imul : Operator.MULTIPLY];
 	Cfg curCfg = new Cfg([], JumpCondition.UNCONDITIONAL, symbol.value);
 	X86Instruction[] buffer;
-	JumpCondition[X86InstructionId] jumpTypes = [X86InstructionId.jle : JumpCondition.LESSEQUAL, X86InstructionId.jmp : JumpCondition.UNCONDITIONAL];
+	JumpCondition[X86InstructionId] jumpTypes = [X86InstructionId.jle : JumpCondition.LESSEQUAL, X86InstructionId.jmp : JumpCondition.UNCONDITIONAL, X86InstructionId.je : JumpCondition.EQUAL, X86InstructionId.jne : JumpCondition.NOTEQUAL];
+	jumpCondOps = [JumpCondition.LESSEQUAL : "<=", JumpCondition.UNCONDITIONAL : "error you should never see this", JumpCondition.EQUAL : "==", JumpCondition.NOTEQUAL : "!="];
 	foreach (inst; assembly) {
 		if (cast(X86InstructionId)inst.idAsInt() in jumpTypes) {
 			curCfg.cond = jumpTypes[cast(X86InstructionId)inst.idAsInt()];
@@ -432,11 +654,13 @@ void main(string[] argv) {
 		}
 	}
 	cfg ~= curCfg;
-	foreach (node; cfg) {
-		auto needSplit = cfg.find!(a => a.bodyContainsAddr(node.addressIfTrue));
+	int nodeIndex = 0;
+	while (nodeIndex < cfg.length) {
+		auto node = cfg[nodeIndex++];
+		auto needSplit = cfg.find!(a => a !is node && a.bodyContainsAddr(node.addressIfTrue));
 		if (!needSplit.empty) needSplit.front.bifurcate(node.addressIfTrue);
-		if (node.cond == JumpCondition.UNCONDITIONAL) break;
-		needSplit = cfg.find!(a => a.bodyContainsAddr(node.addressIfFalse));
+		if (node.cond == JumpCondition.UNCONDITIONAL) continue;
+		needSplit = cfg.find!(a => a !is node && a.bodyContainsAddr(node.addressIfFalse));
 		if (!needSplit.empty) needSplit.front.bifurcate(node.addressIfFalse);
 	}
 	foreach (node; cfg) {
@@ -445,30 +669,21 @@ void main(string[] argv) {
 			if (other.address == node.addressIfFalse) node.ifFalse = other;
 		}
 	}
-	outer: while (true) {
-		cfg = cfg.filter!(a => a.index).array;
-		/*foreach (node; cfg) {
-			writefln!"------------------------------";
-			writefln!"Cfg node %d at %x"(node.index, node.address);
-			if (node.cond == JumpCondition.UNCONDITIONAL) {
-				writefln!"Always %x"(node.ifTrue is null ? 0 : node.ifTrue.address);
-			} else {
-				writefln!"If %s, %x else %x"(node.cond, node.ifTrue is null ? 0 : node.ifTrue.address, node.ifFalse is null ? 0 : node.ifFalse.address);
-			}
-			writefln!"------------------------------";
-			node.code.debugPrint();
-			writefln!"------------------------------\n";
-		}*/
+	restartTransformLoop:
+		cfg = cfg.filter!(a => a.index != 0).array;
 		// attempt ifelse
 		foreach (index; 0..cfg.length) {
-			if (cfg[index].performIfElseTransform()) continue outer;
+			if (cfg[index].performIfElseTransform()) goto restartTransformLoop;
+		}
+		// attempt if
+		foreach (index; 0..cfg.length) {
+			if (cfg[index].performIfTransform()) goto restartTransformLoop;
 		}
 		// attempt block
 		foreach (index; 0..cfg.length) {
-			if (cfg[index].performBlockTransform()) continue outer;
+			if (cfg[index].performBlockTransform()) goto restartTransformLoop;
 		}
-		break;
-	}
+	
 	foreach (node; cfg) {
 		writefln!"------------------------------";
 		writefln!"Cfg node %d at %x"(node.index, node.address);
@@ -481,7 +696,10 @@ void main(string[] argv) {
 		node.code.debugPrint();
 		writefln!"------------------------------\n";
 	}
-	return;
+	assert(cfg.length == 1);
+	cfg.front.code.decompile();
+	writeln(cfg.front.code.toString);
+	return;/*
 	foreach (inst; assembly) {
 		writefln!"%10x: %-30s %-8s %s"(inst.address, inst.bytes().map!(a => format!"%02x"(a)).join(' '), inst.mnemonic(), inst.opStr());
 		curAddress = inst.address + inst.bytes().length;
@@ -549,6 +767,7 @@ void main(string[] argv) {
 				toOp(X86RegisterId.rax, new Expression(new Atomic(tempNum, 8, false, AtomicTypes.TEMPORARY)));
 				break;
 			case X86InstructionId.ret:
+				register(X86RegisterId.rax).beUsed();
 				decomp ~= new ReturnStatement(register(X86RegisterId.rax));
 				break;
 			case X86InstructionId.push:
@@ -583,5 +802,5 @@ void main(string[] argv) {
 		}
 	}
 	writeln("\n-----------------\n");
-	writeln(decomp.map!(to!string).filter!(a => a.length).join('\n'));
+	writeln(decomp.map!(to!string).filter!(a => a.length).join('\n'));*/
 }

@@ -1,12 +1,7 @@
-#include <stdio.h>
-
-int main() {
-	int x = 5;
-	int t = 1;
-	if (x > 6) {
-		t++;
-	} else {
-		t--;
-	}
-	return t;
+int main(){
+  int n = 0;
+  int* p = &n;
+  *p = 1;
+  if(*p == n){return 1;}
+  return 0;
 }
